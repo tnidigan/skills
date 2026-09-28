@@ -1,87 +1,150 @@
-# bootbench.py -- data model & report internals
+# Data Model
 
-## Source-of-truth rule
+## Source of truth
 
-`Boot-Charts/bootchart-data-<slug>.json` is the **only** file ever written directly (by
-`capture`, or by hand via `report --report-cmd add-run`). `Boot-Charts/bootchart-overview-<slug>.html`
-is **always** fully derived from that JSON by `bootbench.py` -- never hand-authored or
-hand-patched. Re-running `report --report-cmd render` regenerates the HTML byte-for-byte from
-whatever is currently in the JSON. `<slug>` is the target name with hyphens/underscores
-stripped (e.g. `iq-9075-evk` -> `iq9075evk`).
+`Boot-Charts/bootchart-data-<slug>.json` (`<slug>` = target name with
+hyphens/underscores stripped) is normally only ever changed via the
+`capture` stage or `report --report-cmd add-run` — never hand-edit it
+directly, with exactly one sanctioned exception: an agent filling in a
+boot's `optimization_possibilities` field per the Workflow in `SKILL.md`.
+No other field should be hand-edited.
+
+`Boot-Charts/bootchart-overview-<slug>.html` is **entirely** generated from
+that JSON by `render()`. Never hand-edit it — re-run `report
+--report-cmd render` after any JSON change to regenerate it exactly.
 
 ## Run entry schema
 
-A "run" appended to the JSON's `runs` array is either a single boot (legacy/flat form) or a
-multi-boot entry (current form, produced by `capture`):
+Each element of the JSON's `runs` array is either:
 
-```json
-{
-  "timestamp": "YYYY-MM-DD HH:MM",
-  "build_path": "\\\\swayam\\...\\performance",
-  "boots": [
-    {
-      "timestamp": "YYYY-MM-DD HH:MM",
-      "build_path": "\\\\swayam\\...\\performance",
-      "metrics": {
-        "nhlos":           {"value": "5.035 s", "note": "4.318 s firmware + 0.717 s loader"},
-        "kernel":          {"value": "1.573 s", "note": ""},
-        "initramfs":       {"value": "0.458 s", "note": "0.092 s -> 0.550 s"},
-        "sysinit_svc":     {"value": "2.734 s", "note": "0.550 s -> 3.284 s",
-                             "hitters": [{"name": "systemd-tmpfiles-setup.service", "time": "0.057 s"}, ...]},
-        "total_sysinit":   {"value": "9.342 s", "note": ""},
-        "total_multiuser": {"value": "19.005 s", "note": "~19.79 s incl. graphical.target",
-                             "hitters": [{"name": "android-tools-adbd.service", "time": "10.416 s"}, ...]}
-      },
-      "critical_chain": ["docker.service", "network-online.target", "..."],
-      "source": "..."
-    },
-    ...
-  ]
-}
-```
+- a **legacy flat entry** — a single boot's fields directly at the top
+  level (`timestamp`, `metrics`, etc.), from before multi-boot capture
+  existed, or
+- a **multi-boot entry** (current format, produced by `capture`):
+  ```json
+  {
+    "timestamp": "...",
+    "build_path": "...",
+    "boots": [ <default boot>, <debug boot> ]
+  }
+  ```
 
-- `metrics` keys (`nhlos`, `kernel`, `initramfs`, `sysinit_svc`, `total_sysinit`,
-  `total_multiuser`) are **fixed row labels** across every run -- they line up as rows in the
-  Boot Time Summary table regardless of which run/boot column you're looking at.
-- `nhlos`, `kernel`, and `initramfs` never carry a `hitters` key -- there's no per-component
-  timing source for them (no `initcall_debug`, no bootloader trace).
-- `critical_chain` and `source` are optional, kept for backup/`.txt`-dump context.
+As of this version, a freshly captured multi-boot entry's `boots` list
+always has exactly **2** items — the first default-phase boot and the
+first debug-phase boot — even if `--num-boots` captured more per phase.
+Older entries already on disk (written before this change) may still have
+`2N` boots; they render as repeated columns and are left as-is — no
+migration is performed.
+
+Each boot object has:
+
+- `timestamp` — `YYYY-MM-DD HH:MM`
+- `build_path` — the nightly build path used
+- `phase` — `"default"` or `"debug"` (absent on legacy entries)
+- `log_name` — e.g. `"default-1"`, `"debug-1"` (absent on legacy entries;
+  used to derive the simplified `Default`/`Debug` column header)
+- `metrics` — object, fixed keys: `nhlos`, `kernel`, `initramfs`,
+  `sysinit_svc`, `total_sysinit`, `total_multiuser`. Each metric has
+  `value`, `note`, and optionally `hitters` (see below).
+- `critical_chain` — ordered list of unit names (optional)
+- `overall_overheads` — list of up to 3 hitter dicts (new, see below)
+- `optimization_possibilities` — `null`, or a placeholder string (new, see below)
+- `source` — free-text provenance string (optional)
+
+`nhlos`, `initramfs`, and `total_sysinit` never carry `hitters` — there's
+no per-component timing source for them today. `kernel` only carries
+`hitters` on a debug-phase boot whose `dmesg` actually had
+`initcall_debug` timing output (see below); it's absent otherwise,
+including on every default-phase boot.
+
+## Kernel-row debug hitters (new)
+
+On a debug-phase boot, if that boot's `dmesg.txt` contains
+`initcall_debug`-style timing/failure lines, `metrics.kernel.hitters` is
+populated with up to 6 entries:
+
+1. Up to 3 entries: the slowest probes/initcalls by usecs, descending.
+   `{"name": "<probe/initcall>", "time": "<seconds> s", "note": "slowest probe/initcall"}`
+2. Up to 3 entries: probe/initcall failures (deduped by name).
+   `{"name": "<probe/initcall>", "time": "rc=<n>", "note": "probe/initcall failure"}` or
+   `{"name": "<driver/device>", "time": "error <n>", "note": "probe failure"}`
+
+If `dmesg` carries no such output at all (Type #2 bootloader, or any other
+reason the debug cmdline params weren't active for that boot),
+`metrics.kernel` has **no** `hitters` key — the same shape as a
+default-phase boot. This absence is exactly what drives the rendered "No
+debug prints enabled" subtitle under that boot's column header — it's a
+content check, not a separately stored flag, so it's correct even for
+runs produced via `--resume-pull` (which never touches the cmdline-editing
+step at all).
+
+## Overall Suspected Overheads (new)
+
+`overall_overheads` is computed for **every** boot (default and debug
+alike). It pools the *individual* hitters already present in that boot's
+`metrics.kernel.hitters` (debug boots only), `metrics.sysinit_svc.hitters`,
+and `metrics.total_multiuser.hitters`, filters out any hitter whose `time`
+isn't a plain parseable duration (this excludes the Kernel row's
+failure-kind entries, e.g. `"rc=-19"` or `"error -5"`, which don't compete
+in a duration ranking), sorts the remaining pool by actual seconds
+descending, and keeps the top 3.
+
+This is **not** a comparison of stage totals (NHLOS vs. kernel vs.
+initramfs vs. sysinit vs. userspace) — it's a re-ranking of the specific
+units already flagged as high-hitters *within* those stages, so the top 3
+are whichever individual costs (a specific slow probe, a specific slow
+service, ...) are the biggest, regardless of which stage they happened to
+occur in. On a default-phase boot (no kernel hitters to contribute), it's
+still populated from that boot's sysinit + multi-user hitters.
+
+## Optimization Possibilities (new)
+
+`optimization_possibilities` is `null` by default. `bootbench.py` sets it
+to a fixed placeholder string on a debug-phase boot whose `metrics.kernel`
+has a non-empty `hitters` list (i.e., debug prints were actually active):
+
+> "Not yet analyzed — ask an agent to review the overheads above and suggest fixes."
+
+`bootbench.py` itself performs no analysis — this field is the one part of
+the schema an agent is expected to hand-edit. Per the skill's Workflow
+(see `SKILL.md`), after a capture completes an agent must read that boot's
+`overall_overheads` (and, on the Debug boot, the Kernel row's
+probe/initcall hitters), write concrete optimization suggestions naming
+the actual unit/probe involved, replace the placeholder (or `null`) in
+this field with that text, then re-render the HTML
+(`report --report-cmd render`) so the report shows it. This is a sanctioned
+exception to the "never hand-edit the JSON" rule — no other field should
+be touched by hand. Default-phase boots, and debug-phase boots with no
+active debug prints, keep it `null` (renders as `–`) unless there's a real
+finding worth writing up from their own `overall_overheads`.
 
 ## Rank, not identity
 
-Wherever a `hitters` list is present, **array position IS rank** -- index 0 is rank #1 for
-that specific boot, not a fixed identity across runs. The High Hitters HTML output is keyed by
-rank (#1, #2, ...), and each run's column independently shows whichever service actually held
-that rank in that boot. Do not union or fix service names into rows: which services appear,
-and in what order, changes between boots (e.g. `weston.service` vs.
-`systemd-udev-trigger.service` swapping at rank #6 across real runs is expected, not a bug).
+Every `hitters` list (Kernel, sysinit, multi-user, and the pooled
+`overall_overheads`) is ranked by time for that specific boot — it is not
+a stable identity list. The same unit can appear at a different rank, or
+not appear at all, on a different boot. This is expected, not a bug.
 
-## Legacy flat `hitters`
+## Legacy flat hitters
 
-Older entries captured before hitters were merged into the per-metric structure may carry a
-flat top-level `"hitters"` list instead of a nested one under `total_multiuser`. Rendering
-falls back to treating that flat list as `total_multiuser`'s hitters, so no data migration is
-required to keep old entries readable.
+Entries captured before hitters were merged into the metrics table may
+carry a flat top-level `hitters` list instead of a nested
+`metrics.total_multiuser.hitters`. Rendering treats a flat list as
+belonging to `total_multiuser`, for backward compatibility.
 
 ## Retention
 
-- `Boot-Charts/bootchart-data-<slug>.json` keeps only the most recent `MAX_RUNS` (30) run
-  entries -- older ones are trimmed from the front on every `add_run`.
-- Full history is preserved regardless of that cap in
-  `Boot-Logs/<target>/<build-folder>/<timestamp>.txt` -- one permanent backup per boot, never
-  trimmed. If a timestamp collides within the same minute (e.g. consecutive boots in a
-  multi-boot entry finishing in the same minute), a numeric suffix (`_2`, `_3`, ...) is added
-  so no boot's backup is silently overwritten.
-
-## Delta annotations
-
-Consecutive runs' metric values are diffed per row. A change of `>= 0.5 s` between
-consecutive runs is shown as a regression (`+`, red) or improvement (`-`, green); anything
-smaller is shown as "unchanged" (grey) -- this is a noise threshold, not a claim that nothing
-happened.
+- JSON/HTML keep only the most recent 30 run entries (trimmed from the
+  front on each `add_run`).
+- Full history survives separately as per-boot `.txt` backups under
+  `Boot-Logs/<target>/<build-folder>/`, unbounded, one per pulled boot
+  (all `2N` of them, not just the 2 shown in the JSON/HTML). Numeric
+  suffixes (`_2`, `_3`, ...) avoid overwriting when multiple boots finish
+  within the same minute-granularity timestamp.
 
 ## Manually appending a run
 
-`report --report-cmd add-run --run-json <file>` validates the run object (`_validate_boot` /
-required keys) before appending, then re-renders the HTML. Always go through this path (or let
-`capture` write it automatically) -- never open the JSON in an editor and add an entry by hand.
+Use `report --report-cmd add-run --run-json <path or ->`. This validates
+the entry against the required schema (raises on missing keys) before
+appending and triggering a re-render. Never bypass this by editing the
+JSON file directly.
