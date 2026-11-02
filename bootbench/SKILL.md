@@ -1,122 +1,133 @@
+# Bootbench — Flash / Capture / Report
+
+Automates the Qualcomm target-device pipeline: find the latest nightly
+build, flash it over EDL via PCAT, boot the device N times to collect
+boot-time logs, parse them into metrics, and render/maintain an HTML boot
+analysis report.
+
+The pipeline is split into three independent stages (flash / capture /
+report), each documented in its own `SKILL.md`, so an agent (or a human)
+can invoke just the stage that's actually needed instead of always
+running the whole thing. Only this root `SKILL.md` is agent-discoverable
+(see "Repository Structure" below); the per-stage `SKILL.md` files are
+reference documentation for whichever stage is actually run.
+
 ---
-name: bootbench
-description: Flashes a Qualcomm EDL device via PCAT with the latest Yocto nightly build, captures boot-time metrics (systemd-analyze, dmesg, journalctl) across a default-cmdline phase and a debug-cmdline phase, extracts kernel probe/initcall overheads from debug dmesg, and generates a compact JSON+HTML boot-time report with cross-stage overhead ranking. Use when the user asks to flash a device and benchmark its boot time, capture boot logs, re-render a boot-time report, or investigate boot-time regressions/overheads for a target like iq-9075-evk.
-compatibility: Windows only. Requires PCAT, an Alpaca TAC debug board, pyserial, comtypes, and adb on PATH.
+
+## Repository Structure
+
+```
+bootbench/                        ← this skill's root (installed at .claude/skills/bootbench/)
+├── SKILL.md                        (agent-discoverable; this file)
+├── flash/                          ← Skill: flash a device over EDL via PCAT
+│   ├── SKILL.md
+│   └── flash.py
+├── capture/                        ← Skill: boot an already-flashed device, collect boot-time data
+│   ├── SKILL.md                    
+│   ├── capture.py                     ← see "Cross-module imports" note below
+│   ├── regression_analysis.py         ← outlier/regression/high-hitter detection, co-located, imported directly
+│   └── reference/                     ← COT docs guiding agent-authored analysis text
+│       ├── COT_outlier_detection.md
+│       ├── COT_regression_rca.md
+│       └── COT_optimization_recommendations.md
+└── report/                         ← Skill: regenerate/maintain the HTML report, no device involved
+    ├── SKILL.md                       
+    ├── report.py                      ← see "Cross-module imports" note below
+    └── Boot-Charts/, Boot-Logs/        (generated output, created once a capture/report has run)
+```
+
+This file (`bootbench/SKILL.md`) is the one agent-discoverable skill
+description for `bootbench` as a whole — it's what actually gets listed
+and invoked as the `bootbench` skill. `flash/SKILL.md`, `capture/SKILL.md`,
+and `report/SKILL.md` document each stage on its own (inputs, workflow,
+outputs) for anyone reading this tree directly, but they are not
+separately-registered skills — routing between the three stages below is
+a judgment call made from this file plus each stage's own `SKILL.md`, not
+automatic discovery of three independent skills.
+
+## flash / capture / report are independent stages
+
+`flash.py`, `capture.py`, and `report.py` are each meant to be run on their
+own, as the entry point for their own stage — not as one monolithic
+pipeline. Prefer invoking just the stage the user actually asked for:
+
+- Only need to flash? Run `flash.py` with no `--all` — it never touches
+  `capture.py`/`report.py` and works even if neither is present.
+- Device already flashed, just want fresh boot numbers? Run `capture.py`
+  on its own.
+- No device involved, just want the report regenerated? Run `report.py`
+  on its own.
+
+`flash.py --all` (chaining straight into capture + report in-process) still
+exists for convenience when a user explicitly asks for the whole pipeline
+in one command, but it's the exception, not the default way these stages
+are meant to be used.
+
+## Cross-module imports: `capture.py` needs `flash.py` + `report.py`
+
+`capture.py` has no serial-console or report-rendering logic of its own —
+it does a plain `import flash` and `import report` and delegates to them
+for everything device- and report-related. `flash.py --all` similarly does
+`import capture` / `import report`, but only when `--all` is actually
+passed (see `flash.py`'s `build_parser()` — the import is skipped
+entirely for a bare `flash.py` invocation, so a flash-only deployment
+never needs `capture.py`/`report.py` present at all).
+
+These imports work under **either** directory layout:
+
+- **Per-usecase** — each script living in its own sibling skill folder,
+  e.g. `.../flash/flash.py`, `.../capture/capture.py`,
+  `.../report/report.py` (how this installed `bootbench` skill tree
+  actually has them — see "Repository Structure" above)
+- **Flat** — `flash.py`/`capture.py`/`report.py` side by side in one
+  folder (an alternative deployment layout the same scripts also support)
+
+Each of the three scripts has an `_ensure_importable(module_name)` helper
+that checks both `<its own folder>/<module_name>.py` and
+`<parent of its own folder>/<module_name>/<module_name>.py`, and inserts
+whichever one actually exists onto `sys.path` before the real
+`import <module_name>`. That's a lightweight shim, not real packaging — it
+exists so moving these scripts between the two layouts above never breaks
+the required imports, without needing to refactor the shared logic into an
+installable package.
+
 ---
 
-# bootbench
+## Stages
 
-`scripts/bootbench.py` is the single entry point. It runs up to three
-stages, always in this fixed order regardless of how they're listed on the
-command line:
+| Stage | Picks this when the user wants to... | Status |
+|---|---|---|
+| **[flash](flash/SKILL.md)** | Flash a target device with a (latest or specific) nightly build over EDL. Can optionally chain into capture + report via `--all`, but is a complete standalone stage on its own | Implemented |
+| **[capture](capture/SKILL.md)** | Boot an already-flashed device N times, collect/parse boot-time logs, and run outlier/regression/root-cause analysis into the report, without reflashing | Implemented |
+| **[report](report/SKILL.md)** | Re-render the HTML report from existing JSON history, manually append a run JSON, or write agent-authored analysis text onto a boot (`set-analysis`) — no device involved | Implemented |
 
-| Stage | Responsibility |
-|---|---|
-| `flash` | Finds the latest Yocto nightly build, detects the target device over serial, flashes it via PCAT over EDL |
-| `capture` | Logs into the serial console, runs a two-phase boot loop (default-cmdline, then debug-cmdline), pulls logs via `adb`, parses them, records+renders the report |
-| `report` | Standalone JSON/HTML maintenance (re-render HTML, or append a run) — not needed after `capture`, which already does this itself |
+### Routing
 
-`all` is shorthand for `flash capture report`.
+- Device needs to be reflashed (new build, wrong build, or just "flash it") → **flash** (standalone)
+- Device is already flashed and the user wants fresh boot-time numbers → **capture** (standalone)
+- No device involved at all — just regenerate/append to the existing report → **report** (standalone)
+- User explicitly wants the whole pipeline in one go ("flash and give me the boot report") → **flash** with `--all` (chains into capture, which itself chains into report) — the one case where running these as a single command, rather than three separate stage invocations, is appropriate
 
-## Setup (one-time)
+Each stage's own `SKILL.md` is the source of truth for its inputs,
+workflow, and outputs.
+
+## Prerequisites
 
 ```
 py -3 -m pip install pyserial comtypes
 ```
 
-`adb` must also be on `PATH`. `pyserial` is needed for `flash` and
-`capture`; `comtypes` only for `flash` (Alpaca TAC automation).
+or
 
-## Which command to run
+```
+python3 -m pip install pyserial comtypes
+```
 
-- Fresh flash + full benchmark: `py -3 scripts/bootbench.py all --yes`
-- Device already flashed, just capture: `py -3 scripts/bootbench.py capture --build-path "\\swayam\...\performance"`
-- A capture's flash/boots succeeded but the `adb pull`/report step failed: `py -3 scripts/bootbench.py capture --resume-pull --target <target> --build-path <path>`
-- Device stuck in EDL/Sahara after an aborted flash: `py -3 scripts/bootbench.py flash --recover`
-- Just re-render the HTML from existing JSON (no device involved): `py -3 scripts/bootbench.py report --report-cmd render --target <target>`
-- Manually append a run JSON: `py -3 scripts/bootbench.py report --report-cmd add-run --run-json <path or -> --target <target>`
+- `pyserial` — required by `flash` and `capture` (serial console login,
+  command execution, port auto-detection)
+- `comtypes` — required by `flash` only (Alpaca TAC COM automation for
+  power-cycle / EDL entry)
+- `adb` must be on `PATH` — used by `capture` to pull logs off the device
 
-Use `py -3` on the ARM64 Python launcher on this machine, or `python3` on a
-regular Windows Python install.
-
-See `references/COMMAND_REFERENCE.md` for the complete flag list and more
-examples.
-
-## Workflow
-
-Follow this sequence any time this skill is activated:
-
-1. **Run the device stage(s) the user asked for** — `flash`, `capture`, or
-   `all` — per "Which command to run" above. `capture` records the run and
-   renders the HTML itself; no separate `report` call is needed right
-   after it.
-2. **Open the just-updated `Boot-Charts/bootchart-data-<slug>.json`** and
-   find the run you just captured (it's the last element of `runs`). Read
-   its `boots` entries.
-3. **Review each boot's `overall_overheads`** — this is the pooled,
-   re-ranked top-3 list of the actual biggest individual time costs for
-   that boot (a specific slow probe, a specific slow service, ...), drawn
-   from the Kernel/sysinit/multi-user hitters. On the Debug boot, also
-   check the Kernel row's own `hitters` (top slow probes/initcalls, plus
-   any probe/initcall failures) for extra root-cause detail.
-4. **Write real, concrete optimization suggestions** for that run based on
-   what you found — not generic advice, and not one paragraph. Write it as
-   a point-wise list: **one bullet per hitter** you're discussing (each
-   service/probe/unit named in `overall_overheads`, plus any debug-boot
-   kernel `hitters` worth calling out). Each bullet should:
-   - Start with `• ` followed by the unit/service/probe name and its time
-     (e.g. `• libvirtd.service (2.362 s): ...`).
-   - Briefly explain why it's likely costing boot time.
-   - Propose a specific fix (e.g. "consider socket-activating it or moving
-     it out of the boot-critical path with `systemd.wants`" or "check for
-     a synchronous link-training wait that could run asynchronously").
-   - Be separated from the next bullet by a newline (`\n`), so each point
-     renders on its own line rather than running together.
-   Do this for every boot in the run that has a non-null-worthy
-   `overall_overheads` list (default and debug alike, whenever there's a
-   real hitter to speak to).
-5. **Write the result into that boot's `optimization_possibilities`
-   field** in the JSON, as a single string with each bullet point on its
-   own line (`\n`-separated), replacing the placeholder string (or
-   `null`) with your concrete analysis. This is the one sanctioned
-   exception to the "never hand-edit the JSON" rule below — this field
-   exists specifically to be filled in by an agent after reviewing
-   `overall_overheads`; nothing else in the file should change.
-6. **Re-render the HTML** so the report reflects what you wrote:
-   `py -3 scripts/bootbench.py report --report-cmd render --target <target>`.
-7. Tell the user what you found and where to look — don't just silently
-   edit the file.
-
-See `references/DATA_MODEL.md` for the full JSON schema, including the
-`overall_overheads` / `optimization_possibilities` fields and the kernel
-row's debug-derived `hitters`.
-
-## Hard rules
-
-- Never hand-edit `bootchart-data-<slug>.json` directly, **except** for
-  writing a run's `optimization_possibilities` field per the Workflow
-  above — that field is the one part of the schema an agent is expected to
-  fill in by hand. Everything else in the JSON is modified only via the
-  `capture` stage or `report --report-cmd add-run`.
-- Never hand-edit `bootchart-overview-<slug>.html`. It is always fully
-  regenerated from the JSON by `render()` — re-run `report
-  --report-cmd render` after any JSON change, including an
-  `optimization_possibilities` edit.
-- A `hitters` list (on the Kernel, sysinit, or multi-user rows, and on the
-  pooled Overall Suspected Overheads row) is rank-ordered for that boot,
-  not an identity list — the same unit can appear at a different rank, or
-  not at all, on a different boot.
-- The debug phase's cmdline edit is **never reverted** once applied to a
-  device — it persists across future `capture`-only runs against the same
-  device, even without reflashing.
-
-## Output locations
-
-- `Boot-Charts/bootchart-data-<slug>.json` + `bootchart-overview-<slug>.html`
-  — one pair per target, `<slug>` = target name with hyphens/underscores
-  stripped. Keeps the most recent 30 runs.
-- `Boot-Logs/<target>/<build-folder>/` — every captured boot's raw log dump
-  (`Logs-default-1..N`, `Logs-debug-1..N`) plus permanent per-boot `.txt`
-  backups (unbounded history, unlike the JSON/HTML's 30-run cap).
-- The HTML report is written to disk but not auto-opened — open it
-  yourself when ready.
+Run with this machine's ARM64 Python launcher (`py -3 ...`), or a regular
+Windows Python install (`python3 ...`).
