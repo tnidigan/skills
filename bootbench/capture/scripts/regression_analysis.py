@@ -42,13 +42,21 @@ Five finding categories, orchestrated by build_analysis():
   (iii) previous_build_regressions -- a unit in this run's displayed boot-1
                                       (default or debug) runs meaningfully
                                       slower than the SAME unit in the
-                                      immediately preceding saved run's
-                                      same-phase boot-1. Comparing directly
-                                      against history_runs[-1] (whatever was
-                                      most recently saved) means this run
-                                      automatically becomes "the previous
-                                      build" for the NEXT run's comparison --
-                                      no separate bookkeeping needed.
+                                      same-phase boot-1 of EACH build being
+                                      compared against: by default, ALL
+                                      previously recorded builds; or, if
+                                      num_previous_builds is given, only the
+                                      most recent num_previous_builds of
+                                      them (fewer if that many don't exist
+                                      yet). Each compared build produces
+                                      its own findings (tagged with that
+                                      build's previous_build_path), so a
+                                      regression that only shows up against
+                                      an older build still surfaces. This
+                                      run's own data becomes part of
+                                      history_runs for the NEXT run's
+                                      comparison once saved -- no separate
+                                      bookkeeping needed.
   (iv)  high_hitters              -- {"ranked": [...], "failures": [...]}
                                       per displayed boot. "ranked" is the
                                       biggest-duration named units by raw
@@ -294,39 +302,50 @@ def detect_unit_outliers_and_regressions(phase_boots: list) -> dict:
     return {"outliers": outliers, "intra_run_regressions": intra_run, "unit_appeared_once": appeared_once}
 
 
-def detect_previous_build_regressions(displayed_boots: list, history_runs: list) -> list:
+def detect_previous_build_regressions(displayed_boots: list, history_runs: list,
+                                       num_previous_builds: int = None) -> list:
     """Regressions (iii): this run's displayed boot-1 of each phase vs. the
-    SAME phase's boot-1 in the immediately preceding saved run
-    (history_runs[-1]). Returns [] if there is no previous build yet."""
+    SAME phase's boot-1 in each build being compared against. By default
+    (num_previous_builds=None, or <= 0) that's EVERY previously recorded
+    build in history_runs; if num_previous_builds is a positive N, it's
+    only the most recent N of them (history_runs[-N:] -- fewer than N if
+    that many don't exist yet, which is the natural result of slicing).
+    Each compared build's findings are independent and separately tagged
+    with that build's previous_build_path -- a regression only visible
+    against an older build (but not the immediately preceding one) is
+    still surfaced, not hidden by whichever build happens to be most
+    recent. Returns [] if there is no previous build yet."""
     if not history_runs:
         return []
 
-    previous_run = history_runs[-1]
-    previous_boots = previous_run.get("boots") or [previous_run]
+    compare_runs = history_runs[-num_previous_builds:] if num_previous_builds and num_previous_builds > 0 else history_runs
 
     findings = []
-    for boot in displayed_boots:
-        prev_boot = next((b for b in previous_boots if b.get("phase") == boot.get("phase")), None)
-        if prev_boot is None:
-            continue
+    for previous_run in compare_runs:
+        previous_boots = previous_run.get("boots") or [previous_run]
 
-        current_named = {(n["name"], n["source"]): n["duration"] for n in collect_named_hitters(boot)}
-        previous_named = {(n["name"], n["source"]): n["duration"] for n in collect_named_hitters(prev_boot)}
-
-        for key, cur_v in current_named.items():
-            if key not in previous_named:
-                continue  # a unit absent from the previous build isn't a regression, just new
-            prev_v = previous_named[key]
-            if prev_v <= 0:
+        for boot in displayed_boots:
+            prev_boot = next((b for b in previous_boots if b.get("phase") == boot.get("phase")), None)
+            if prev_boot is None:
                 continue
-            delta_pct = (cur_v - prev_v) / prev_v * 100
-            if delta_pct > INTRA_RUN_REGRESSION_PCT:
-                findings.append({
-                    "name": key[0], "source": key[1], "phase": boot["phase"], "boot": boot["log_name"],
-                    "current_duration": cur_v, "previous_duration": prev_v,
-                    "delta_pct": round(delta_pct, 1),
-                    "previous_build_path": previous_run.get("build_path"),
-                })
+
+            current_named = {(n["name"], n["source"]): n["duration"] for n in collect_named_hitters(boot)}
+            previous_named = {(n["name"], n["source"]): n["duration"] for n in collect_named_hitters(prev_boot)}
+
+            for key, cur_v in current_named.items():
+                if key not in previous_named:
+                    continue  # a unit absent from the previous build isn't a regression, just new
+                prev_v = previous_named[key]
+                if prev_v <= 0:
+                    continue
+                delta_pct = (cur_v - prev_v) / prev_v * 100
+                if delta_pct > INTRA_RUN_REGRESSION_PCT:
+                    findings.append({
+                        "name": key[0], "source": key[1], "phase": boot["phase"], "boot": boot["log_name"],
+                        "current_duration": cur_v, "previous_duration": prev_v,
+                        "delta_pct": round(delta_pct, 1),
+                        "previous_build_path": previous_run.get("build_path"),
+                    })
     return findings
 
 
@@ -342,9 +361,13 @@ def get_high_hitters(boot: dict, top_n: int = HIGH_HITTER_TOP_N) -> dict:
     return {"ranked": ranked, "failures": failures}
 
 
-def build_analysis(all_boots: list, displayed_boots: list, history_runs: list) -> dict:
+def build_analysis(all_boots: list, displayed_boots: list, history_runs: list,
+                    num_previous_builds: int = None) -> dict:
     """Orchestrates all five finding categories. Returns pure structured
-    data -- no rendering, no English text, no hardcoded ranking/pooling."""
+    data -- no rendering, no English text, no hardcoded ranking/pooling.
+    num_previous_builds controls how many previously recorded builds
+    previous_build_regressions compares against -- None (default) means
+    ALL of them; a positive N means only the most recent N."""
     by_phase = group_by_phase(all_boots)
 
     outliers, intra_run, appeared_once = [], [], []
@@ -358,7 +381,9 @@ def build_analysis(all_boots: list, displayed_boots: list, history_runs: list) -
     return {
         "outliers": outliers,
         "intra_run_regressions": intra_run,
-        "previous_build_regressions": detect_previous_build_regressions(displayed_boots, history_runs),
+        "previous_build_regressions": detect_previous_build_regressions(
+            displayed_boots, history_runs, num_previous_builds
+        ),
         "high_hitters": {b["log_name"]: get_high_hitters(b) for b in displayed_boots},
         "unit_appeared_once": appeared_once,
     }
@@ -516,6 +541,40 @@ def _selftest():
         r["name"] == "wpa_supplicant.service" and r["previous_build_path"] == this_run_as_history["build_path"]
         for r in next_analysis["previous_build_regressions"]
     ), "expected this run to automatically become the next run's previous-build reference"
+
+    # num_previous_builds: with 3 prior builds recorded, each flagging
+    # wpa_supplicant.service as slower than the current run's 0.20s by a
+    # different margin, the default (num_previous_builds=None) must compare
+    # against ALL of them, while num_previous_builds=2 must compare against
+    # only the 2 most recent (builds 2 and 3, not build 1).
+    build_1 = {"build_path": "Build-1", "boots": [
+        _make_boot("default", 1, sysinit_hitters=[{"name": "wpa_supplicant.service", "time": "0.05 s"}]),
+    ]}
+    build_2 = {"build_path": "Build-2", "boots": [
+        _make_boot("default", 1, sysinit_hitters=[{"name": "wpa_supplicant.service", "time": "0.06 s"}]),
+    ]}
+    build_3 = {"build_path": "Build-3", "boots": [
+        _make_boot("default", 1, sysinit_hitters=[{"name": "wpa_supplicant.service", "time": "0.07 s"}]),
+    ]}
+    current_default_boots = [
+        _make_boot("default", 1, sysinit_hitters=[{"name": "wpa_supplicant.service", "time": "0.20 s"}]),
+        _make_boot("default", 2, sysinit_hitters=[{"name": "wpa_supplicant.service", "time": "0.20 s"}]),
+        _make_boot("default", 3, sysinit_hitters=[{"name": "wpa_supplicant.service", "time": "0.20 s"}]),
+    ]
+    current_displayed = [current_default_boots[0]]
+    history = [build_1, build_2, build_3]
+
+    all_builds_findings = detect_previous_build_regressions(current_displayed, history)
+    assert {f["previous_build_path"] for f in all_builds_findings} == {"Build-1", "Build-2", "Build-3"}, \
+        "expected num_previous_builds=None (default) to compare against every prior build"
+
+    last_two_findings = detect_previous_build_regressions(current_displayed, history, num_previous_builds=2)
+    assert {f["previous_build_path"] for f in last_two_findings} == {"Build-2", "Build-3"}, \
+        "expected num_previous_builds=2 to compare against only the 2 most recent prior builds"
+
+    more_than_exist_findings = detect_previous_build_regressions(current_displayed, history, num_previous_builds=10)
+    assert {f["previous_build_path"] for f in more_than_exist_findings} == {"Build-1", "Build-2", "Build-3"}, \
+        "expected num_previous_builds larger than history to fall back to every build that actually exists"
 
     print("All regression_analysis self-checks passed.")
 
